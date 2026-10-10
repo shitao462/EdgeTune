@@ -1,6 +1,32 @@
 import AppKit
 import Carbon
 import Foundation
+import ServiceManagement
+
+private enum MusicPlayer: String, CaseIterable {
+    case netease
+    case qqMusic
+    case spotify
+    case appleMusic
+
+    var name: String {
+        switch self {
+        case .netease: return "网易云音乐"
+        case .qqMusic: return "QQ 音乐"
+        case .spotify: return "Spotify"
+        case .appleMusic: return "Apple Music"
+        }
+    }
+
+    var bundleID: String {
+        switch self {
+        case .netease: return "com.netease.163music"
+        case .qqMusic: return "com.tencent.QQMusicMac"
+        case .spotify: return "com.spotify.client"
+        case .appleMusic: return "com.apple.Music"
+        }
+    }
+}
 
 private struct Track: Equatable {
     let source: String
@@ -21,28 +47,27 @@ private struct LyricLine {
 }
 
 private final class MusicBridge {
-    private let bundleID = "com.netease.163music"
     private var cli: URL? {
         Bundle.main.url(forAuxiliaryExecutable: "nowplaying-cli")
     }
 
-    func read() -> Track? {
-        guard !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty,
+    func read(player: MusicPlayer) -> Track? {
+        guard !NSRunningApplication.runningApplications(withBundleIdentifier: player.bundleID).isEmpty,
               let output = run(["get", "--json", "title", "artist", "album", "elapsedTime", "playbackRate", "bundleIdentifier"]),
               let data = output.data(using: .utf8),
               let info = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              (info["bundleIdentifier"] as? String) == bundleID,
+              (info["bundleIdentifier"] as? String) == player.bundleID,
               let title = info["title"] as? String, !title.isEmpty else { return nil }
         let rate = (info["playbackRate"] as? NSNumber)?.doubleValue ?? 0
-        return Track(source: "网易云音乐", title: title,
+        return Track(source: player.name, title: title,
                      artist: info["artist"] as? String ?? "",
                      album: info["album"] as? String ?? "",
                      position: (info["elapsedTime"] as? NSNumber)?.doubleValue ?? 0,
                      playing: rate > 0, sampledAt: Date())
     }
 
-    func control(_ command: String, source: String?) {
-        guard source == "网易云音乐", ["togglePlayPause", "previous", "next"].contains(command) else { return }
+    func control(_ command: String, player: MusicPlayer) {
+        guard ["togglePlayPause", "previous", "next"].contains(command), read(player: player) != nil else { return }
         _ = run([command])
     }
 
@@ -110,6 +135,10 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
     private var lyricsLoading = false
     private var readInFlight = false
     private var statusItem: NSStatusItem!
+    private var settingsWindow: NSWindow?
+    private var playerPicker: NSPopUpButton?
+    private var loginCheckbox: NSButton?
+    private var loginStatusLabel: NSTextField?
     private var panel: NSPanel!
     private var root: HoverView!
     private var expandedContent: NSView!
@@ -120,6 +149,7 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
     private var pinned = false
     private var collapseWork: DispatchWorkItem?
     private var hotKey: EventHotKeyRef?
+    private var selectedPlayer = MusicPlayer(rawValue: UserDefaults.standard.string(forKey: "selectedPlayer") ?? "") ?? .netease
     private let width: CGFloat = 316
     private let height: CGFloat = 110
     private let sliver: CGFloat = 24
@@ -166,13 +196,14 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
         expandedContent.addSubview(accent)
 
         titleLabel = label("没有正在播放的音乐", x: 18, y: 77, width: 188, size: 13, color: .white, weight: .semibold)
-        artistLabel = label("打开网易云音乐", x: 18, y: 56, width: 235, size: 10, color: .secondaryLabelColor)
+        artistLabel = label("打开\(selectedPlayer.name)", x: 18, y: 56, width: 235, size: 10, color: .secondaryLabelColor)
         lyricLabel = label("♪  歌词会显示在这里", x: 18, y: 28, width: 280, size: 12, color: NSColor(calibratedRed: 0.48, green: 0.95, blue: 0.80, alpha: 1))
         [titleLabel!, artistLabel!, lyricLabel!].forEach { expandedContent.addSubview($0) }
 
         addButton("backward.fill", x: 210, y: 71, action: #selector(previous))
         addButton("playpause.fill", x: 244, y: 71, action: #selector(playPause))
         addButton("forward.fill", x: 278, y: 71, action: #selector(next))
+        addButton("gearshape", x: 208, y: 23, action: #selector(showSettings))
         addButton("pin", x: 242, y: 23, action: #selector(togglePin))
         addButton("chevron.right", x: 276, y: 23, action: #selector(collapseAction))
 
@@ -214,6 +245,7 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "显示 / 收起浮窗  ⌥⌘M", action: #selector(togglePanel), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "固定 / 自动收起", action: #selector(togglePin), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "退出 EdgeTune", action: #selector(quit), keyEquivalent: ""))
         menu.items.forEach { $0.target = self }
@@ -234,17 +266,22 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
     private func refreshTrack() {
         guard !readInFlight else { return }
         readInFlight = true
+        let player = selectedPlayer
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            let current = self.bridge.read()
-            DispatchQueue.main.async { self.readInFlight = false; self.apply(current) }
+            let current = self.bridge.read(player: player)
+            DispatchQueue.main.async {
+                self.readInFlight = false
+                if self.selectedPlayer == player { self.apply(current) }
+                else { self.refreshTrack() }
+            }
         }
     }
 
     private func apply(_ current: Track?) {
         track = current
         titleLabel.stringValue = current?.title ?? "没有正在播放的音乐"
-        artistLabel.stringValue = current.map { "\($0.artist) · \($0.source)" } ?? "打开网易云音乐"
+        artistLabel.stringValue = current.map { "\($0.artist) · \($0.source)" } ?? "打开\(selectedPlayer.name)"
         if let current, current.identity != lyricTrackID {
             lyricTrackID = current.identity
             lyricLines = []
@@ -309,10 +346,85 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
     @objc private func next() { control("next") }
     @objc private func quit() { NSApp.terminate(nil) }
 
+    @objc private func showSettings() {
+        if settingsWindow == nil { createSettingsWindow() }
+        refreshLoginStatus()
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func createSettingsWindow() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 390, height: 225),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "EdgeTune 设置"
+        window.center()
+        window.isReleasedWhenClosed = false
+        let content = NSView(frame: window.contentView!.bounds)
+        window.contentView = content
+
+        let playerTitle = label("控制的音乐软件", x: 24, y: 175, width: 190, size: 13, color: .labelColor, weight: .semibold)
+        content.addSubview(playerTitle)
+        let picker = NSPopUpButton(frame: NSRect(x: 22, y: 136, width: 346, height: 30), pullsDown: false)
+        MusicPlayer.allCases.forEach { picker.addItem(withTitle: $0.name) }
+        picker.selectItem(at: MusicPlayer.allCases.firstIndex(of: selectedPlayer) ?? 0)
+        picker.target = self
+        picker.action = #selector(changePlayer)
+        content.addSubview(picker)
+        playerPicker = picker
+
+        let hint = label("仅控制所选播放器在系统中显示的当前歌曲。", x: 24, y: 110, width: 340, size: 11, color: .secondaryLabelColor)
+        content.addSubview(hint)
+        let checkbox = NSButton(checkboxWithTitle: "登录 Mac 后自动启动 EdgeTune", target: self, action: #selector(changeLaunchAtLogin))
+        checkbox.frame = NSRect(x: 22, y: 62, width: 345, height: 25)
+        content.addSubview(checkbox)
+        loginCheckbox = checkbox
+        let status = label("", x: 24, y: 34, width: 340, size: 11, color: .secondaryLabelColor)
+        content.addSubview(status)
+        loginStatusLabel = status
+        settingsWindow = window
+    }
+
+    @objc private func changePlayer() {
+        guard let picker = playerPicker, MusicPlayer.allCases.indices.contains(picker.indexOfSelectedItem) else { return }
+        selectedPlayer = MusicPlayer.allCases[picker.indexOfSelectedItem]
+        UserDefaults.standard.set(selectedPlayer.rawValue, forKey: "selectedPlayer")
+        apply(nil)
+        refreshTrack()
+    }
+
+    private func refreshLoginStatus() {
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            loginCheckbox?.state = .on
+            loginStatusLabel?.stringValue = "已开启开机启动"
+        case .requiresApproval:
+            loginCheckbox?.state = .on
+            loginStatusLabel?.stringValue = "请在系统设置的登录项中允许 EdgeTune"
+        default:
+            loginCheckbox?.state = .off
+            loginStatusLabel?.stringValue = "当前不会开机启动"
+        }
+    }
+
+    @objc private func changeLaunchAtLogin() {
+        do {
+            if loginCheckbox?.state == .on { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+            refreshLoginStatus()
+        } catch {
+            refreshLoginStatus()
+            let alert = NSAlert()
+            alert.messageText = "无法更改开机启动设置"
+            alert.informativeText = error.localizedDescription
+            if let settingsWindow { alert.beginSheetModal(for: settingsWindow) }
+            else { alert.runModal() }
+        }
+    }
+
     private func control(_ command: String) {
-        let source = track?.source
+        let player = selectedPlayer
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.bridge.control(command, source: source)
+            self?.bridge.control(command, player: player)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self?.refreshTrack() }
         }
     }
