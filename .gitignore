@@ -1,3 +1,4 @@
 outputs/
 work/
 *.dSYM/
+.DS_Store

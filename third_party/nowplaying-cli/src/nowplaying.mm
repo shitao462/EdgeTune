@@ -161,12 +161,17 @@ static void printJSON(NSDictionary *dict) {
 
 static id getValueForKey(NSDictionary *info, NSString *key) {
     NSObject *rawValue = [info objectForKey:key];
+    // The adapter's source identifier uses ClientBundleIdentifier in legacy info.
+    if (!rawValue && [key isEqualToString:@"kMRMediaRemoteNowPlayingInfoBundleIdentifier"]) {
+        rawValue = info[@"kMRMediaRemoteNowPlayingInfoClientBundleIdentifier"];
+    }
     if (!rawValue) return nil;
 
     if ([key isEqualToString:@"kMRMediaRemoteNowPlayingInfoArtworkData"] ||
         [key isEqualToString:@"kMRMediaRemoteNowPlayingInfoClientPropertiesData"]) {
         return [(NSData *)rawValue base64EncodedStringWithOptions:0];
     } else if ([key isEqualToString:@"kMRMediaRemoteNowPlayingInfoElapsedTime"]) {
+        if ([info[@"__nowplaying_cli_elapsed_time_is_current"] boolValue]) return rawValue;
         MRContentItem *contentItem = [[objc_getClass("MRContentItem") alloc]
                                       initWithNowPlayingInfo:(__bridge NSDictionary *)info];
         return @(contentItem.metadata.calculatedPlaybackPosition);
@@ -275,6 +280,9 @@ static NSDictionary *ReadViaHelperBinary(void) {
     NSTask *task = [[NSTask alloc] init];
     [task setLaunchPath:@"/usr/bin/perl"];
     [task setArguments:@[scriptPath, dylibPath, @"adapter_get_env"]];
+    NSMutableDictionary *environment = [[[NSProcessInfo processInfo] environment] mutableCopy];
+    environment[@"MEDIAREMOTEADAPTER_OPTION_now"] = @"1";
+    [task setEnvironment:environment];
 
     NSPipe *pipe = [NSPipe pipe];
     [task setStandardOutput:pipe];
@@ -344,6 +352,12 @@ static NSDictionary *LegacyInfoDictFromHelperJSON(NSDictionary *json) {
         } else {
             info[legacyKey] = value;
         }
+    }
+
+    NSNumber *elapsedNow = json[@"elapsedTimeNow"];
+    if ([elapsedNow isKindOfClass:[NSNumber class]]) {
+        info[@"kMRMediaRemoteNowPlayingInfoElapsedTime"] = elapsedNow;
+        info[@"__nowplaying_cli_elapsed_time_is_current"] = @YES;
     }
 
     return ([info count] > 0) ? info : nil;

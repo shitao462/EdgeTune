@@ -6,9 +6,10 @@
   <key>CFBundleIdentifier</key><string>dev.opentune.edgetune</string>
   <key>CFBundleExecutable</key><string>EdgeTune</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2</string>
-  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>3</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSAppleEventsUsageDescription</key><string>读取所选音乐软件的当前歌曲并控制播放。</string>
+  <key>NSAudioCaptureUsageDescription</key><string>在本机分析所选音乐播放器的音频强弱，让边缘条随音乐起伏，不保存音频。</string>
 </dict></plist>

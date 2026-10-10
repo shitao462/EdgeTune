@@ -2,6 +2,122 @@ import AppKit
 import Carbon
 import Foundation
 import ServiceManagement
+import QuartzCore
+import ScreenCaptureKit
+import AVFoundation
+
+// Only an audio output is attached: no screen frames or recordings are retained.
+private final class AudioPulse: NSObject, SCStreamOutput, SCStreamDelegate {
+    private var capture: SCStream?
+    private var source: String?
+    private var generation = 0
+    private var starting = false
+    private var retryAfter = Date.distantPast
+    private var needsPermission = false
+    private let audioQueue = DispatchQueue(label: "dev.opentune.edgetune.audio")
+    private(set) var level: Double = 0
+    private(set) var lastSample = Date.distantPast
+    var statusChanged: ((String) -> Void)?
+
+    func setSource(_ bundleID: String?) {
+        if source == bundleID {
+            guard bundleID != nil, capture == nil, !starting, Date() >= retryAfter else { return }
+            if needsPermission && !CGPreflightScreenCaptureAccess() { return }
+        }
+        source = bundleID
+        generation += 1
+        let token = generation
+        let old = capture
+        capture = nil
+        level = 0
+        lastSample = .distantPast
+        starting = bundleID != nil
+        Task { @MainActor in
+            if let old { try? await old.stopCapture() }
+            guard self.generation == token, let bundleID else { return }
+            do {
+                self.statusChanged?("正在连接播放器音频…")
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                guard self.generation == token else { return }
+                guard let display = content.displays.first,
+                      let app = content.applications.first(where: { $0.bundleIdentifier == bundleID }) else {
+                    self.starting = false
+                    self.retryAfter = Date().addingTimeInterval(5)
+                    self.statusChanged?("等待播放器音频，正在自动重连")
+                    return
+                }
+                let filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+                let config = SCStreamConfiguration()
+                config.capturesAudio = true
+                config.excludesCurrentProcessAudio = true
+                config.sampleRate = 48000
+                config.channelCount = 2
+                config.width = 2
+                config.height = 2
+                config.minimumFrameInterval = CMTime(seconds: 1, preferredTimescale: 600)
+                let stream = SCStream(filter: filter, configuration: config, delegate: self)
+                try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: self.audioQueue)
+                self.capture = stream
+                try await stream.startCapture()
+                guard self.generation == token else { try? await stream.stopCapture(); return }
+                self.starting = false
+                self.needsPermission = false
+                self.statusChanged?("已连接音频，边缘条跟随音乐强弱起伏")
+                NSLog("EdgeTune audio: connected")
+            } catch {
+                guard self.generation == token else { return }
+                self.capture = nil
+                self.starting = false
+                self.retryAfter = Date().addingTimeInterval(5)
+                self.needsPermission = (error as NSError).code == -3801
+                NSLog("EdgeTune audio: %@", error.localizedDescription)
+                self.statusChanged?(self.needsPermission ? "请在系统设置允许录制权限，授权后自动重连" : "音频连接失败，正在自动重连")
+            }
+        }
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
+        guard outputType == .audio, let value = Self.measure(sampleBuffer) else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.capture === stream else { return }
+            if self.lastSample == .distantPast { NSLog("EdgeTune audio: first sample, level %.3f", value) }
+            self.level = value
+            self.lastSample = Date()
+        }
+    }
+
+    static func measure(_ sampleBuffer: CMSampleBuffer) -> Double? {
+        guard sampleBuffer.isValid, let description = sampleBuffer.formatDescription else { return nil }
+        let format = AVAudioFormat(cmAudioFormatDescription: description)
+        let count = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard count > 0, let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)) else { return nil }
+        pcm.frameLength = AVAudioFrameCount(count)
+        guard CMSampleBufferCopyPCMDataIntoAudioBufferList(sampleBuffer, at: 0, frameCount: Int32(count), into: pcm.mutableAudioBufferList) == noErr,
+              let channels = pcm.floatChannelData else { return nil }
+        var energy: Double = 0
+        let channelCount = Int(format.channelCount)
+        for channel in 0..<channelCount {
+            for frame in 0..<count {
+                let sample = Double(format.isInterleaved ? channels[0][frame * pcm.stride + channel] : channels[channel][frame])
+                energy += sample * sample
+            }
+        }
+        let rms = sqrt(energy / Double(count * channelCount))
+        return max(0, min(1, (20 * log10(max(rms, 0.00001)) + 55) / 45))
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.capture === stream else { return }
+            self.capture = nil
+            self.starting = false
+            self.retryAfter = Date().addingTimeInterval(5)
+            self.level = 0
+            self.lastSample = .distantPast
+            self.statusChanged?("音频连接已中断，正在自动重连")
+        }
+    }
+}
 
 private enum MusicPlayer: String, CaseIterable {
     case netease
@@ -33,6 +149,7 @@ private struct Track: Equatable {
     let title: String
     let artist: String
     let album: String
+    let duration: Double
     let position: Double
     let playing: Bool
     let sampledAt: Date
@@ -53,7 +170,7 @@ private final class MusicBridge {
 
     func read(player: MusicPlayer) -> Track? {
         guard !NSRunningApplication.runningApplications(withBundleIdentifier: player.bundleID).isEmpty,
-              let output = run(["get", "--json", "title", "artist", "album", "elapsedTime", "playbackRate", "bundleIdentifier"]),
+              let output = run(["get", "--json", "title", "artist", "album", "duration", "elapsedTime", "playbackRate", "bundleIdentifier"]),
               let data = output.data(using: .utf8),
               let info = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               (info["bundleIdentifier"] as? String) == player.bundleID,
@@ -62,6 +179,7 @@ private final class MusicBridge {
         return Track(source: player.name, title: title,
                      artist: info["artist"] as? String ?? "",
                      album: info["album"] as? String ?? "",
+                     duration: (info["duration"] as? NSNumber)?.doubleValue ?? 0,
                      position: (info["elapsedTime"] as? NSNumber)?.doubleValue ?? 0,
                      playing: rate > 0, sampledAt: Date())
     }
@@ -88,17 +206,64 @@ private final class MusicBridge {
     }
 }
 
+private struct LyricsResult {
+    var lines: [LyricLine] = []
+    var instrumental = false
+}
+
 private final class LyricsService {
-    func fetch(for track: Track, completion: @escaping ([LyricLine]) -> Void) {
-        var components = URLComponents(string: "https://lrclib.net/api/search")!
-        components.queryItems = [URLQueryItem(name: "track_name", value: track.title), URLQueryItem(name: "artist_name", value: track.artist)]
-        var request = URLRequest(url: components.url!)
-        request.setValue("EdgeTune/0.2 (open source macOS player)", forHTTPHeaderField: "User-Agent")
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            let records = (data.flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? [[String: Any]] ?? []
-            let match = records.first { ($0["syncedLyrics"] as? String)?.isEmpty == false }
-            completion(Self.parse(match?["syncedLyrics"] as? String ?? ""))
+    func fetch(for track: Track, completion: @escaping (LyricsResult) -> Void) {
+        var query = [URLQueryItem(name: "track_name", value: track.title), URLQueryItem(name: "artist_name", value: track.artist)]
+        if !track.album.isEmpty { query.append(URLQueryItem(name: "album_name", value: track.album)) }
+        if track.duration > 0 && track.duration <= 3600 { query.append(URLQueryItem(name: "duration", value: String(track.duration))) }
+        request(endpoint: "get", query: query) { object in
+            if let record = object as? [String: Any] {
+                let result = Self.resolve([record], for: track)
+                if !result.lines.isEmpty || result.instrumental { completion(result); return }
+            }
+            // Search also finds records with incomplete album metadata.
+            self.request(endpoint: "search", query: Array(query.prefix(2))) { object in
+                completion(Self.resolve(object as? [[String: Any]] ?? [], for: track))
+            }
+        }
+    }
+
+    private func request(endpoint: String, query: [URLQueryItem], completion: @escaping (Any?) -> Void) {
+        var components = URLComponents(string: "https://lrclib.net/api/\(endpoint)")!
+        components.queryItems = query
+        var request = URLRequest(url: components.url!, timeoutInterval: 12)
+        request.setValue("EdgeTune/1.0 (open source macOS player)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { completion(nil); return }
+            completion(data.flatMap { try? JSONSerialization.jsonObject(with: $0) })
         }.resume()
+    }
+
+    static func resolve(_ records: [[String: Any]], for track: Track) -> LyricsResult {
+        func normalized(_ value: String) -> String {
+            value.trimmingCharacters(in: .whitespacesAndNewlines).folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        }
+        let matches = records.filter {
+            normalized($0["trackName"] as? String ?? "") == normalized(track.title) &&
+            normalized($0["artistName"] as? String ?? "") == normalized(track.artist)
+        }
+        let precise = matches.filter {
+            let albumMatches = !track.album.isEmpty && normalized($0["albumName"] as? String ?? "") == normalized(track.album)
+            let durationMatches = track.duration > 0 && abs((($0["duration"] as? NSNumber)?.doubleValue ?? -10000) - track.duration) <= 2
+            return albumMatches || durationMatches
+        }
+        let candidates = precise.isEmpty ? matches : precise
+        for record in candidates {
+            let lines = Self.parse(record["syncedLyrics"] as? String ?? "")
+            if !lines.isEmpty { return LyricsResult(lines: lines) }
+        }
+        // Absence of lyrics is not evidence of an instrumental track.
+        let instrumental = !precise.isEmpty && precise.allSatisfy {
+            ($0["instrumental"] as? Bool) == true &&
+            ($0["plainLyrics"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            ($0["syncedLyrics"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return LyricsResult(instrumental: instrumental)
     }
 
     private static func parse(_ value: String) -> [LyricLine] {
@@ -113,7 +278,72 @@ private final class LyricsService {
     }
 }
 
+private enum WindowTheme: String, CaseIterable {
+    case dark, light, glass
+    var name: String {
+        switch self {
+        case .dark: return "黑色"
+        case .light: return "白色"
+        case .glass: return "玻璃 · 毛玻璃效果"
+        }
+    }
+    var background: NSColor {
+        switch self {
+        case .dark: return NSColor(calibratedRed: 0.075, green: 0.085, blue: 0.12, alpha: 0.94)
+        case .light: return NSColor(calibratedWhite: 0.98, alpha: 0.97)
+        case .glass: return .clear
+        }
+    }
+}
+
+private enum MusicTheme: String, CaseIterable {
+    case mint, blue, purple, pink, orange, ocean, aurora, sunset
+    var name: String {
+        switch self {
+        case .mint: return "莹绿色"
+        case .blue: return "天空蓝"
+        case .purple: return "薰衣草紫"
+        case .pink: return "樱花粉"
+        case .orange: return "暖橙色"
+        case .ocean: return "渐变 · 海洋蓝绿"
+        case .aurora: return "渐变 · 极光蓝紫"
+        case .sunset: return "渐变 · 日落粉橙"
+        }
+    }
+    var colors: [NSColor] {
+        func color(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> NSColor {
+            NSColor(calibratedRed: r, green: g, blue: b, alpha: 1)
+        }
+        switch self {
+        case .mint: return [color(0.36, 0.91, 0.75)]
+        case .blue: return [color(0.35, 0.72, 1)]
+        case .purple: return [color(0.75, 0.61, 1)]
+        case .pink: return [color(1, 0.58, 0.76)]
+        case .orange: return [color(1, 0.72, 0.38)]
+        case .ocean: return [color(0.35, 0.72, 1), color(0.36, 0.91, 0.75)]
+        case .aurora: return [color(0.35, 0.72, 1), color(0.75, 0.61, 1)]
+        case .sunset: return [color(1, 0.58, 0.76), color(1, 0.72, 0.38)]
+        }
+    }
+}
+
 private final class HoverView: NSView {
+    var edgeGradient: CAGradientLayer?
+    var pulseScale: CGFloat = 1
+    func updatePulseFrame() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let h = bounds.height * (0.5 + 0.5 * pulseScale)
+        edgeGradient?.frame = NSRect(x: 0, y: 0, width: bounds.width, height: h)
+        CATransaction.commit()
+    }
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        updatePulseFrame()
+        CATransaction.commit()
+    }
     var enter: (() -> Void)?
     var exit: (() -> Void)?
     override var mouseDownCanMoveWindow: Bool { true }
@@ -129,14 +359,28 @@ private final class HoverView: NSView {
 private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
     private let bridge = MusicBridge()
     private let lyrics = LyricsService()
+    private let audioPulse = AudioPulse()
+    private var pulseEnabled = UserDefaults.standard.object(forKey: "pulseEnabled") as? Bool ?? true
+    private var pulseCheckbox: NSButton?
+    private var pulseStatusLabel: NSTextField?
+    private var pulseStatus = "播放音乐时需允许系统音频录制"
+    private var pulseScale: CGFloat = 1
     private var track: Track?
     private var lyricLines: [LyricLine] = []
+    private var instrumental = false
     private var lyricTrackID = ""
     private var lyricsLoading = false
     private var readInFlight = false
     private var statusItem: NSStatusItem!
     private var settingsWindow: NSWindow?
     private var playerPicker: NSPopUpButton?
+    private var themePicker: NSPopUpButton?
+    private var windowThemePicker: NSPopUpButton?
+    private var selectedWindowTheme = WindowTheme(rawValue: UserDefaults.standard.string(forKey: "windowTheme") ?? "") ?? .dark
+    private var glassView: NSVisualEffectView!
+    private let accentGradient = CAGradientLayer()
+    private let edgeGradient = CAGradientLayer()
+    private var selectedTheme = MusicTheme(rawValue: UserDefaults.standard.string(forKey: "selectedTheme") ?? "") ?? .mint
     private var loginCheckbox: NSButton?
     private var loginStatusLabel: NSTextField?
     private var panel: NSPanel!
@@ -148,20 +392,31 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
     private var collapsed = false
     private var pinned = false
     private var collapseWork: DispatchWorkItem?
+    private var edgeHoverStarted: Date?
+    private var transitionID = 0
+    private var transitioning = false
     private var hotKey: EventHotKeyRef?
     private var selectedPlayer = MusicPlayer(rawValue: UserDefaults.standard.string(forKey: "selectedPlayer") ?? "") ?? .netease
     private let width: CGFloat = 316
     private let height: CGFloat = 110
-    private let sliver: CGFloat = 24
+    private let sliver: CGFloat = 7
+    private let hiddenHeight: CGFloat = 72
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         createPanel()
         createMenu()
+        audioPulse.statusChanged = { [weak self] text in
+            self?.pulseStatus = text
+            self?.pulseStatusLabel?.stringValue = text
+        }
         installHotKey()
         panel.orderFrontRegardless()
+        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.updateHover() }
+        scheduleCollapse()
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refreshTrack() }
         Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in self?.refreshLyric() }
+        Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.animatePulse() }
         refreshTrack()
     }
 
@@ -179,25 +434,54 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
 
         root = HoverView(frame: NSRect(origin: .zero, size: frame.size))
         root.wantsLayer = true
+        root.autoresizingMask = [.width, .height]
+        root.layer?.masksToBounds = true
         root.layer?.backgroundColor = NSColor(calibratedRed: 0.075, green: 0.085, blue: 0.12, alpha: 0.94).cgColor
         root.layer?.cornerRadius = 16
         root.layer?.borderWidth = 1
         root.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
-        root.enter = { [weak self] in self?.collapseWork?.cancel() }
+        edgeGradient.frame = root.bounds
+        edgeGradient.opacity = 0
+        edgeGradient.cornerRadius = 3.5
+        edgeGradient.masksToBounds = true
+        edgeGradient.startPoint = CGPoint(x: 0, y: 1)
+        edgeGradient.endPoint = CGPoint(x: 0, y: 0)
+        root.layer?.addSublayer(edgeGradient)
+        root.edgeGradient = edgeGradient
+        root.enter = { [weak self] in self?.cancelCollapse() }
         root.exit = { [weak self] in self?.scheduleCollapse() }
         panel.contentView = root
+
+        glassView = NSVisualEffectView(frame: root.bounds)
+        glassView.autoresizingMask = [.width, .height]
+        glassView.material = .hudWindow
+        glassView.blendingMode = .behindWindow
+        glassView.state = .active
+        glassView.appearance = NSAppearance(named: .aqua)
+        root.addSubview(glassView)
 
         expandedContent = NSView(frame: root.bounds)
         root.addSubview(expandedContent)
         let accent = NSView(frame: NSRect(x: 0, y: 17, width: 3, height: 76))
         accent.wantsLayer = true
-        accent.layer?.backgroundColor = NSColor(calibratedRed: 0.36, green: 0.91, blue: 0.75, alpha: 1).cgColor
-        accent.layer?.cornerRadius = 2
+        accentGradient.frame = accent.bounds
+        accentGradient.startPoint = CGPoint(x: 0, y: 1)
+        accentGradient.endPoint = CGPoint(x: 0, y: 0)
+        accent.layer?.addSublayer(accentGradient)
+        accent.layer?.masksToBounds = true
+        accent.layer?.cornerRadius = 1.5
+        accentGradient.cornerRadius = 1.5
+        accentGradient.masksToBounds = true
         expandedContent.addSubview(accent)
 
         titleLabel = label("没有正在播放的音乐", x: 18, y: 77, width: 188, size: 13, color: .white, weight: .semibold)
         artistLabel = label("打开\(selectedPlayer.name)", x: 18, y: 56, width: 235, size: 10, color: .secondaryLabelColor)
-        lyricLabel = label("♪  歌词会显示在这里", x: 18, y: 28, width: 280, size: 12, color: NSColor(calibratedRed: 0.48, green: 0.95, blue: 0.80, alpha: 1))
+        lyricLabel = label("♪  歌词会显示在这里", x: 18, y: 10, width: 178, size: 12, color: NSColor(calibratedRed: 0.48, green: 0.95, blue: 0.80, alpha: 1))
+        lyricLabel.frame.size.height = 36
+        lyricLabel.maximumNumberOfLines = 2
+        lyricLabel.lineBreakMode = .byWordWrapping
+        lyricLabel.cell?.wraps = true
+        lyricLabel.cell?.isScrollable = false
         [titleLabel!, artistLabel!, lyricLabel!].forEach { expandedContent.addSubview($0) }
 
         addButton("backward.fill", x: 210, y: 71, action: #selector(previous))
@@ -207,16 +491,9 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
         addButton("pin", x: 242, y: 23, action: #selector(togglePin))
         addButton("chevron.right", x: 276, y: 23, action: #selector(collapseAction))
 
-        let tab = NSButton(frame: NSRect(x: 1, y: 37, width: 22, height: 36))
-        tab.title = "♫"
-        tab.font = .systemFont(ofSize: 17, weight: .medium)
-        tab.isBordered = false
-        tab.contentTintColor = .white
-        tab.target = self
-        tab.action = #selector(expandAction)
-        tab.identifier = NSUserInterfaceItemIdentifier("collapsedTab")
-        tab.isHidden = true
-        root.addSubview(tab)
+        applyTheme()
+        applyWindowTheme()
+
     }
 
     private func label(_ text: String, x: CGFloat, y: CGFloat, width: CGFloat, size: CGFloat, color: NSColor, weight: NSFont.Weight = .regular) -> NSTextField {
@@ -280,17 +557,20 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
 
     private func apply(_ current: Track?) {
         track = current
+        audioPulse.setSource(pulseEnabled && current?.playing == true ? selectedPlayer.bundleID : nil)
         titleLabel.stringValue = current?.title ?? "没有正在播放的音乐"
         artistLabel.stringValue = current.map { "\($0.artist) · \($0.source)" } ?? "打开\(selectedPlayer.name)"
         if let current, current.identity != lyricTrackID {
             lyricTrackID = current.identity
             lyricLines = []
+            instrumental = false
             lyricsLoading = true
             lyricLabel.stringValue = "正在查找同步歌词…"
-            lyrics.fetch(for: current) { [weak self] lines in
+            lyrics.fetch(for: current) { [weak self] result in
                 DispatchQueue.main.async {
                     guard let self, self.lyricTrackID == current.identity else { return }
-                    self.lyricLines = lines
+                    self.lyricLines = result.lines
+                    self.instrumental = result.instrumental
                     self.lyricsLoading = false
                     self.refreshLyric()
                 }
@@ -298,6 +578,7 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
         } else if current == nil {
             lyricTrackID = ""
             lyricLines = []
+            instrumental = false
             lyricsLoading = false
             lyricLabel.stringValue = "♪  歌词会显示在这里"
         }
@@ -306,6 +587,7 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
     private func refreshLyric() {
         guard let track else { return }
         guard !lyricsLoading else { return }
+        if instrumental { lyricLabel.stringValue = "纯音乐，请欣赏"; return }
         guard !lyricLines.isEmpty else {
             lyricLabel.stringValue = "暂未找到同步歌词"
             return
@@ -314,24 +596,111 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
         lyricLabel.stringValue = lyricLines.last(where: { $0.time <= time })?.text ?? lyricLines[0].text
     }
 
+    private func animatePulse() {
+        let active = pulseEnabled && track?.playing == true && Date().timeIntervalSince(audioPulse.lastSample) < 0.4
+        let target: CGFloat = active ? CGFloat(audioPulse.level) : 1
+        pulseScale += (target - pulseScale) * (target > pulseScale ? 0.5 : 0.16)
+        guard abs(root.pulseScale - pulseScale) > 0.001 else { return }
+        root.pulseScale = pulseScale
+        root.updatePulseFrame()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let h = 76 * (0.5 + 0.5 * pulseScale)
+        accentGradient.frame = NSRect(x: 0, y: 0, width: 3, height: h)
+        CATransaction.commit()
+    }
+
     private func scheduleCollapse() {
-        guard !pinned, !collapsed else { return }
-        collapseWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.setCollapsed(true) }
+        guard !pinned, !collapsed, collapseWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.collapseWork = nil
+            guard !self.pinned, !self.panel.frame.contains(NSEvent.mouseLocation) else { return }
+            self.setCollapsed(true)
+        }
         collapseWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+    }
+
+    private func cancelCollapse() {
+        collapseWork?.cancel()
+        collapseWork = nil
+    }
+
+    private func updateHover() {
+        guard panel.isVisible, !transitioning else { return }
+        let mouse = NSEvent.mouseLocation
+        if !collapsed {
+            if panel.frame.contains(mouse) { cancelCollapse() }
+            else { scheduleCollapse() }
+            return
+        }
+        let screen = panel.screen?.frame ?? NSScreen.main!.frame
+        let trigger = NSRect(x: screen.maxX - 8, y: panel.frame.minY - 12,
+                             width: 8, height: hiddenHeight + 24)
+        guard trigger.contains(mouse) else { edgeHoverStarted = nil; return }
+        if let started = edgeHoverStarted {
+            if Date().timeIntervalSince(started) >= 0.2 { setCollapsed(false) }
+        } else { edgeHoverStarted = Date() }
     }
 
     private func setCollapsed(_ value: Bool) {
         guard value != collapsed else { return }
+        cancelCollapse()
+        edgeHoverStarted = nil
         collapsed = value
-        let screen = panel.screen?.visibleFrame ?? NSScreen.main!.visibleFrame
+        transitionID += 1
+        let currentTransition = transitionID
+        transitioning = true
+        let screen = panel.screen?.frame ?? NSScreen.main!.frame
+        let visible = panel.screen?.visibleFrame ?? NSScreen.main!.visibleFrame
         let newWidth = value ? sliver : width
+        let newHeight = value ? hiddenHeight : height
         let x = value ? screen.maxX - sliver : screen.maxX - width - 12
-        panel.setFrame(NSRect(x: x, y: panel.frame.origin.y, width: newWidth, height: height), display: true, animate: true)
-        root.frame = NSRect(x: 0, y: 0, width: newWidth, height: height)
-        expandedContent.isHidden = value
-        root.subviews.first(where: { $0.identifier?.rawValue == "collapsedTab" })?.isHidden = !value
+        let y = min(max(panel.frame.midY - newHeight / 2, visible.minY), visible.maxY - newHeight)
+        expandedContent.isHidden = false
+        glassView.isHidden = selectedWindowTheme != .glass
+        let timing = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
+        let duration = value ? 0.32 : 0.38
+        if let layer = root.layer {
+            let color = value ? NSColor.clear.cgColor : selectedWindowTheme.background.cgColor
+            let fade = CABasicAnimation(keyPath: "backgroundColor")
+            fade.fromValue = layer.presentation()?.backgroundColor ?? layer.backgroundColor
+            fade.toValue = color
+            fade.duration = duration
+            fade.timingFunction = timing
+            layer.backgroundColor = color
+            layer.add(fade, forKey: "edgeColor")
+            let rounding = CABasicAnimation(keyPath: "cornerRadius")
+            rounding.fromValue = layer.presentation()?.cornerRadius ?? layer.cornerRadius
+            rounding.toValue = value ? sliver / 2 : 16
+            rounding.duration = duration
+            rounding.timingFunction = timing
+            layer.cornerRadius = value ? sliver / 2 : 16
+            layer.add(rounding, forKey: "edgeRounding")
+            layer.borderWidth = value ? 0 : 1
+        }
+        let edgeFade = CABasicAnimation(keyPath: "opacity")
+        edgeFade.fromValue = edgeGradient.presentation()?.opacity ?? edgeGradient.opacity
+        edgeFade.toValue = value ? 0.8 : 0
+        edgeFade.duration = duration
+        edgeFade.timingFunction = timing
+        edgeGradient.opacity = value ? 0.8 : 0
+        edgeGradient.add(edgeFade, forKey: "edgeFade")
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = duration
+            context.timingFunction = timing
+            expandedContent.animator().alphaValue = value ? 0 : 1
+            glassView.animator().alphaValue = value ? 0 : 1
+            panel.animator().setFrame(NSRect(x: x, y: y, width: newWidth, height: newHeight), display: true)
+        } completionHandler: { [weak self] in
+            guard let self, self.transitionID == currentTransition else { return }
+            self.transitioning = false
+            self.expandedContent.isHidden = value
+            self.glassView.isHidden = value || self.selectedWindowTheme != .glass
+            self.panel.hasShadow = !value
+            if !value { self.scheduleCollapse() }
+        }
     }
 
     @objc private func togglePanel() {
@@ -340,7 +709,7 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
     }
     @objc private func expandAction() { setCollapsed(false); scheduleCollapse() }
     @objc private func collapseAction() { setCollapsed(true) }
-    @objc private func togglePin() { pinned.toggle(); if !pinned { scheduleCollapse() } else { collapseWork?.cancel() } }
+    @objc private func togglePin() { pinned.toggle(); if !pinned { scheduleCollapse() } else { cancelCollapse() } }
     @objc private func previous() { control("previous") }
     @objc private func playPause() { control("togglePlayPause") }
     @objc private func next() { control("next") }
@@ -354,7 +723,7 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
     }
 
     private func createSettingsWindow() {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 390, height: 225),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 390, height: 525),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "EdgeTune 设置"
         window.center()
@@ -381,7 +750,99 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
         let status = label("", x: 24, y: 34, width: 340, size: 11, color: .secondaryLabelColor)
         content.addSubview(status)
         loginStatusLabel = status
+        for view in content.subviews { view.frame.origin.y += 100 }
+        content.addSubview(label("主题色", x: 24, y: 86, width: 190, size: 13, color: .labelColor, weight: .semibold))
+        let themes = NSPopUpButton(frame: NSRect(x: 22, y: 47, width: 346, height: 30), pullsDown: false)
+        for theme in MusicTheme.allCases {
+            themes.addItem(withTitle: theme.name)
+            let swatch = NSImage(size: NSSize(width: 28, height: 14), flipped: false) { rect in
+                let colors = theme.colors.count == 1 ? [theme.colors[0], theme.colors[0]] : theme.colors
+                NSGradient(colors: colors)?.draw(in: NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4), angle: 0)
+                return true
+            }
+            themes.lastItem?.image = swatch
+        }
+        themes.selectItem(at: MusicTheme.allCases.firstIndex(of: selectedTheme) ?? 0)
+        themes.target = self
+        themes.action = #selector(changeTheme)
+        content.addSubview(themes)
+        themePicker = themes
+        content.addSubview(label("立即生效，边缘与歌词同步换色。", x: 24, y: 20, width: 340, size: 11, color: .secondaryLabelColor))
+        for view in content.subviews { view.frame.origin.y += 100 }
+        content.addSubview(label("窗口主题", x: 24, y: 86, width: 190, size: 13, color: .labelColor, weight: .semibold))
+        let surfaces = NSPopUpButton(frame: NSRect(x: 22, y: 47, width: 346, height: 30), pullsDown: false)
+        WindowTheme.allCases.forEach { surfaces.addItem(withTitle: $0.name) }
+        surfaces.selectItem(at: WindowTheme.allCases.firstIndex(of: selectedWindowTheme) ?? 0)
+        surfaces.target = self
+        surfaces.action = #selector(changeWindowTheme)
+        content.addSubview(surfaces)
+        windowThemePicker = surfaces
+        content.addSubview(label("玻璃效果会模糊透出窗口后面的内容。", x: 24, y: 20, width: 340, size: 11, color: .secondaryLabelColor))
+        for view in content.subviews { view.frame.origin.y += 100 }
+        let pulse = NSButton(checkboxWithTitle: "边缘条跟随音乐节奏", target: self, action: #selector(changePulse))
+        pulse.frame = NSRect(x: 22, y: 72, width: 346, height: 26)
+        pulse.state = pulseEnabled ? .on : .off
+        content.addSubview(pulse)
+        pulseCheckbox = pulse
+        let pulseHint = label(pulseStatus, x: 24, y: 44, width: 342, size: 10, color: .secondaryLabelColor)
+        content.addSubview(pulseHint)
+        pulseStatusLabel = pulseHint
+        content.addSubview(label("仅在本机分析播放器音量，不保存音频。", x: 24, y: 20, width: 342, size: 11, color: .secondaryLabelColor))
         settingsWindow = window
+    }
+
+    private func applyTheme() {
+        let colors = selectedTheme.colors
+        let stops = (colors.count == 1 ? [colors[0], colors[0]] : colors).map { $0.cgColor }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        accentGradient.colors = stops
+        edgeGradient.colors = stops
+        CATransaction.commit()
+        lyricLabel.textColor = selectedWindowTheme == .dark ? colors[0] : colors[0].blended(withFraction: 0.42, of: .black)
+    }
+
+    @objc private func changePulse() {
+        pulseEnabled = pulseCheckbox?.state == .on
+        UserDefaults.standard.set(pulseEnabled, forKey: "pulseEnabled")
+        audioPulse.setSource(pulseEnabled && track?.playing == true ? selectedPlayer.bundleID : nil)
+        if !pulseEnabled {
+            pulseStatus = "节奏动画已关闭"
+            pulseStatusLabel?.stringValue = pulseStatus
+        } else if track?.playing != true {
+            pulseStatus = "等待所选播放器开始播放"
+            pulseStatusLabel?.stringValue = pulseStatus
+        }
+    }
+
+    private func applyWindowTheme() {
+        let dark = selectedWindowTheme == .dark
+        root.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        root.layer?.removeAnimation(forKey: "edgeColor")
+        root.layer?.backgroundColor = collapsed ? NSColor.clear.cgColor : selectedWindowTheme.background.cgColor
+        root.layer?.borderColor = (dark ? NSColor.white.withAlphaComponent(0.12) : NSColor.black.withAlphaComponent(0.14)).cgColor
+        glassView.isHidden = collapsed || selectedWindowTheme != .glass
+        glassView.alphaValue = collapsed ? 0 : 1
+        titleLabel.textColor = dark ? .white : NSColor(calibratedWhite: 0.1, alpha: 1)
+        artistLabel.textColor = dark ? NSColor(calibratedWhite: 0.72, alpha: 1) : NSColor(calibratedWhite: 0.34, alpha: 1)
+        for case let button as NSButton in expandedContent.subviews {
+            button.contentTintColor = dark ? NSColor.white.withAlphaComponent(0.85) : NSColor(calibratedWhite: 0.16, alpha: 1)
+        }
+        applyTheme()
+    }
+
+    @objc private func changeWindowTheme() {
+        guard let picker = windowThemePicker, WindowTheme.allCases.indices.contains(picker.indexOfSelectedItem) else { return }
+        selectedWindowTheme = WindowTheme.allCases[picker.indexOfSelectedItem]
+        UserDefaults.standard.set(selectedWindowTheme.rawValue, forKey: "windowTheme")
+        applyWindowTheme()
+    }
+
+    @objc private func changeTheme() {
+        guard let picker = themePicker, MusicTheme.allCases.indices.contains(picker.indexOfSelectedItem) else { return }
+        selectedTheme = MusicTheme.allCases[picker.indexOfSelectedItem]
+        UserDefaults.standard.set(selectedTheme.rawValue, forKey: "selectedTheme")
+        applyTheme()
     }
 
     @objc private func changePlayer() {
