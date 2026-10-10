@@ -93,7 +93,7 @@ private final class LyricsService {
         var components = URLComponents(string: "https://lrclib.net/api/search")!
         components.queryItems = [URLQueryItem(name: "track_name", value: track.title), URLQueryItem(name: "artist_name", value: track.artist)]
         var request = URLRequest(url: components.url!)
-        request.setValue("EdgeTune/0.1 (open source macOS player)", forHTTPHeaderField: "User-Agent")
+        request.setValue("EdgeTune/0.2 (open source macOS player)", forHTTPHeaderField: "User-Agent")
         URLSession.shared.dataTask(with: request) { data, _, _ in
             let records = (data.flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? [[String: Any]] ?? []
             let match = records.first { ($0["syncedLyrics"] as? String)?.isEmpty == false }
