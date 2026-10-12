@@ -14,6 +14,10 @@ private final class AudioPulse: NSObject, SCStreamOutput, SCStreamDelegate {
     private var starting = false
     private var retryAfter = Date.distantPast
     private var needsPermission = false
+    private let diagnostics = ProcessInfo.processInfo.environment["EDGETUNE_AUDIO_DIAGNOSTICS"] == "1"
+    private var diagnosticTime = Date()
+    private var diagnosticMin: Double = 1
+    private var diagnosticMax: Double = 0
     private let audioQueue = DispatchQueue(label: "dev.opentune.edgetune.audio")
     private(set) var level: Double = 0
     private(set) var lastSample = Date.distantPast
@@ -83,6 +87,16 @@ private final class AudioPulse: NSObject, SCStreamOutput, SCStreamDelegate {
             if self.lastSample == .distantPast { NSLog("EdgeTune audio: first sample, level %.3f", value) }
             self.level = value
             self.lastSample = Date()
+            if self.diagnostics {
+                self.diagnosticMin = min(self.diagnosticMin, value)
+                self.diagnosticMax = max(self.diagnosticMax, value)
+                if self.lastSample.timeIntervalSince(self.diagnosticTime) >= 3 {
+                    NSLog("EdgeTune audio: live level range %.3f...%.3f", self.diagnosticMin, self.diagnosticMax)
+                    self.diagnosticTime = self.lastSample
+                    self.diagnosticMin = 1
+                    self.diagnosticMax = 0
+                }
+            }
         }
     }
 

@@ -248,6 +248,10 @@ static BOOL ResolveHelperPaths(NSString **scriptPath, NSString **dylibPath) {
     for (NSString *base in bases) {
         NSArray<NSArray<NSString *> *> *layouts = @[
             @[
+                [base stringByAppendingPathComponent:@"../Resources/scripts/mediaremote-mini.pl"],
+                [base stringByAppendingPathComponent:@"../Frameworks/MediaRemoteMini.dylib"],
+            ],
+            @[
                 [base stringByAppendingPathComponent:@"scripts/mediaremote-mini.pl"],
                 [base stringByAppendingPathComponent:@"build/mediaremote-mini/MediaRemoteMini.dylib"],
             ],
