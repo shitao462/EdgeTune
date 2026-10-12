@@ -175,6 +175,7 @@ private struct Track: Equatable {
 private struct LyricLine {
     let time: Double
     let text: String
+    var translation: String? = nil
 }
 
 private final class MusicBridge {
@@ -227,6 +228,135 @@ private struct LyricsResult {
 
 private final class LyricsService {
     func fetch(for track: Track, completion: @escaping (LyricsResult) -> Void) {
+        if track.source == MusicPlayer.netease.name {
+            fetchNetEase(for: track) { result in
+                if let result { completion(result) }
+                else { self.fetchLRCLIB(for: track, completion: completion) }
+            }
+        } else if track.source == MusicPlayer.qqMusic.name {
+            fetchQQMusic(for: track) { result in
+                if let result { completion(result) }
+                else { self.fetchLRCLIB(for: track, completion: completion) }
+            }
+        } else {
+            fetchLRCLIB(for: track, completion: completion)
+        }
+    }
+
+    private func fetchNetEase(for track: Track, completion: @escaping (LyricsResult?) -> Void) {
+        request(url: "https://music.163.com/api/search/get/web", query: [
+            URLQueryItem(name: "s", value: "\(track.title) \(track.artist)"),
+            URLQueryItem(name: "type", value: "1"), URLQueryItem(name: "limit", value: "20")
+        ]) { object in
+            let songs = ((object as? [String: Any])?["result"] as? [String: Any])?["songs"] as? [[String: Any]] ?? []
+            guard let id = Self.netEaseSongID(songs, for: track) else { completion(nil); return }
+            self.request(url: "https://music.163.com/api/song/lyric", query: [
+                URLQueryItem(name: "id", value: String(id)), URLQueryItem(name: "lv", value: "-1"),
+                URLQueryItem(name: "tv", value: "-1"), URLQueryItem(name: "kv", value: "-1")
+            ]) { object in
+                completion((object as? [String: Any]).flatMap(Self.netEaseLyrics))
+            }
+        }
+    }
+
+    private func fetchQQMusic(for track: Track, completion: @escaping (LyricsResult?) -> Void) {
+        let payload: [String: Any] = ["comm": ["ct": 19, "cv": 1859], "req": [
+            "module": "music.search.SearchCgiService", "method": "DoSearchForQQMusicDesktop",
+            "param": ["query": "\(track.title) \(track.artist)", "num_per_page": 20, "page_num": 1, "search_type": 0]
+        ]]
+        request(url: "https://u.y.qq.com/cgi-bin/musicu.fcg", query: [], body: payload) { object in
+            guard let root = object as? [String: Any], (root["code"] as? Int) == 0,
+                  let req = root["req"] as? [String: Any], (req["code"] as? Int) == 0 else { completion(nil); return }
+            let data = req["data"] as? [String: Any]
+            let body = data?["body"] as? [String: Any]
+            let songs = (body?["song"] as? [String: Any])?["list"] as? [[String: Any]] ?? []
+            guard let mid = Self.qqSongMID(songs, for: track) else { completion(nil); return }
+            self.request(url: "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg", query: [
+                URLQueryItem(name: "songmid", value: mid), URLQueryItem(name: "format", value: "json"),
+                URLQueryItem(name: "nobase64", value: "1")
+            ]) { object in
+                completion((object as? [String: Any]).flatMap(Self.qqLyrics))
+            }
+        }
+    }
+
+    static func qqSongMID(_ songs: [[String: Any]], for track: Track) -> String? {
+        let records: [[String: Any]] = songs.enumerated().map { index, song in
+            ["id": index, "name": song["name"] as? String ?? "", "artists": song["singer"] as? [[String: Any]] ?? [],
+             "album": song["album"] as? [String: Any] ?? [:],
+             "duration": ((song["interval"] as? NSNumber)?.doubleValue ?? 0) * 1000]
+        }
+        guard let index = netEaseSongID(records, for: track), let mid = songs[index]["mid"] as? String, !mid.isEmpty else { return nil }
+        return mid
+    }
+
+    static func qqLyrics(_ object: [String: Any]) -> LyricsResult? {
+        guard (object["code"] as? Int) == 0, (object["retcode"] as? Int ?? 0) == 0 else { return nil }
+        func decoded(_ value: String) -> String {
+            var text = value
+            if !text.contains("["), let bytes = Data(base64Encoded: text), let raw = String(data: bytes, encoding: .utf8) { text = raw }
+            let numeric = try! NSRegularExpression(pattern: "&#(x[0-9a-fA-F]+|[0-9]+);")
+            let ns = text as NSString
+            for match in numeric.matches(in: text, range: NSRange(location: 0, length: ns.length)).reversed() {
+                let token = ns.substring(with: match.range(at: 1))
+                let number = token.hasPrefix("x") ? UInt32(token.dropFirst(), radix: 16) : UInt32(token)
+                if let number, let scalar = UnicodeScalar(number), let range = Range(match.range, in: text) { text.replaceSubrange(range, with: String(scalar)) }
+            }
+            for (entity, replacement) in [("&apos;", "'"), ("&quot;", "\""), ("&lt;", "<"), ("&gt;", ">"), ("&nbsp;", " "), ("&amp;", "&")] {
+                text = text.replacingOccurrences(of: entity, with: replacement)
+            }
+            return text
+        }
+        // Missing or restricted lyrics are not evidence that a song is instrumental.
+        return netEaseLyrics(["lrc": ["lyric": decoded(object["lyric"] as? String ?? "")],
+                              "tlyric": ["lyric": decoded(object["trans"] as? String ?? "")]])
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    static func netEaseSongID(_ songs: [[String: Any]], for track: Track) -> Int? {
+        let matches = songs.filter { song in
+            let artists = (song["artists"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String }
+            let artist = normalized(track.artist)
+            let artistMatches = !artist.isEmpty && (artists.contains { normalized($0) == artist } ||
+                ["/", ",", " & ", "、"].contains { normalized(artists.joined(separator: $0)) == artist })
+            let duration = (song["duration"] as? NSNumber)?.doubleValue ?? 0
+            return normalized(song["name"] as? String ?? "") == normalized(track.title) && artistMatches &&
+                track.duration > 0 && abs(duration / 1000 - track.duration) <= 2
+        }
+        let albumMatches = matches.filter { !track.album.isEmpty &&
+            normalized(($0["album"] as? [String: Any])?["name"] as? String ?? "") == normalized(track.album) }
+        let candidates = albumMatches.isEmpty ? matches : albumMatches
+        // Ambiguous versions use the fallback rather than silently picking the first search hit.
+        guard candidates.count == 1 else { return nil }
+        return (candidates[0]["id"] as? NSNumber)?.intValue
+    }
+
+    static func netEaseLyrics(_ object: [String: Any]) -> LyricsResult? {
+        if (object["uncollected"] as? Bool) == true { return nil }
+        let raw = (object["lrc"] as? [String: Any])?["lyric"] as? String ?? ""
+        let originals = parse(raw)
+        if (object["nolyric"] as? Bool) == true && originals.isEmpty { return LyricsResult(instrumental: true) }
+        if originals.contains(where: { $0.text == "纯音乐，请欣赏" || $0.text == "纯音乐，请欣赏。" }) {
+            return LyricsResult(instrumental: true)
+        }
+        guard !originals.isEmpty else { return nil }
+        let translations = parse((object["tlyric"] as? [String: Any])?["lyric"] as? String ?? "")
+        let lines = originals.map { line -> LyricLine in
+            var line = line
+            if let translated = translations.min(by: { abs($0.time - line.time) < abs($1.time - line.time) }),
+               abs(translated.time - line.time) <= 0.35, translated.text != line.text {
+                line.translation = translated.text
+            }
+            return line
+        }
+        return LyricsResult(lines: lines)
+    }
+
+    private func fetchLRCLIB(for track: Track, completion: @escaping (LyricsResult) -> Void) {
         var query = [URLQueryItem(name: "track_name", value: track.title), URLQueryItem(name: "artist_name", value: track.artist)]
         if !track.album.isEmpty { query.append(URLQueryItem(name: "album_name", value: track.album)) }
         if track.duration > 0 && track.duration <= 3600 { query.append(URLQueryItem(name: "duration", value: String(track.duration))) }
@@ -243,10 +373,22 @@ private final class LyricsService {
     }
 
     private func request(endpoint: String, query: [URLQueryItem], completion: @escaping (Any?) -> Void) {
-        var components = URLComponents(string: "https://lrclib.net/api/\(endpoint)")!
+        request(url: "https://lrclib.net/api/\(endpoint)", query: query, completion: completion)
+    }
+
+    private func request(url: String, query: [URLQueryItem], body: [String: Any]? = nil, completion: @escaping (Any?) -> Void) {
+        var components = URLComponents(string: url)!
         components.queryItems = query
         var request = URLRequest(url: components.url!, timeoutInterval: 12)
-        request.setValue("EdgeTune/1.0 (open source macOS player)", forHTTPHeaderField: "User-Agent")
+        request.setValue("EdgeTune/1.2 (open source macOS player)", forHTTPHeaderField: "User-Agent")
+        if components.host == "music.163.com" { request.setValue("https://music.163.com/", forHTTPHeaderField: "Referer") }
+        if components.host?.hasSuffix(".y.qq.com") == true { request.setValue("https://y.qq.com/", forHTTPHeaderField: "Referer") }
+        if let body {
+            guard let data = try? JSONSerialization.data(withJSONObject: body) else { completion(nil); return }
+            request.httpMethod = "POST"
+            request.httpBody = data
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         URLSession.shared.dataTask(with: request) { data, response, _ in
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { completion(nil); return }
             completion(data.flatMap { try? JSONSerialization.jsonObject(with: $0) })
@@ -281,13 +423,22 @@ private final class LyricsService {
     }
 
     private static func parse(_ value: String) -> [LyricLine] {
-        value.split(separator: "\n").compactMap { raw in
+        let regex = try! NSRegularExpression(pattern: "\\[(\\d+):(\\d+(?:\\.\\d+)?)\\]")
+        let offsetRegex = try! NSRegularExpression(pattern: "\\[offset:([+-]?\\d+)\\]")
+        let nsValue = value as NSString
+        let offset = offsetRegex.firstMatch(in: value, range: NSRange(location: 0, length: nsValue.length))
+            .flatMap { Double(nsValue.substring(with: $0.range(at: 1))) }.map { $0 / 1000 } ?? 0
+        return value.split(separator: "\n").flatMap { raw -> [LyricLine] in
             let line = String(raw)
-            guard line.hasPrefix("["), let end = line.firstIndex(of: "]") else { return nil }
-            let stamp = line[line.index(after: line.startIndex)..<end].split(separator: ":")
-            guard stamp.count == 2, let minutes = Double(stamp[0]), let seconds = Double(stamp[1]) else { return nil }
-            let text = line[line.index(after: end)...].trimmingCharacters(in: .whitespacesAndNewlines)
-            return text.isEmpty ? nil : LyricLine(time: minutes * 60 + seconds, text: text)
+            let nsLine = line as NSString
+            let stamps = regex.matches(in: line, range: NSRange(location: 0, length: nsLine.length))
+            guard let last = stamps.last, stamps.first?.range.location == 0 else { return [] }
+            let text = nsLine.substring(from: NSMaxRange(last.range)).trimmingCharacters(in: .whitespacesAndNewlines)
+            return stamps.compactMap { stamp in
+                guard let minutes = Double(nsLine.substring(with: stamp.range(at: 1))),
+                      let seconds = Double(nsLine.substring(with: stamp.range(at: 2))), seconds < 60 else { return nil }
+                return LyricLine(time: max(0, minutes * 60 + seconds - offset), text: text)
+            }
         }.sorted { $0.time < $1.time }
     }
 }
@@ -403,6 +554,7 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
     private var titleLabel: NSTextField!
     private var artistLabel: NSTextField!
     private var lyricLabel: NSTextField!
+    private var translationLabel: NSTextField!
     private var collapsed = false
     private var pinned = false
     private var collapseWork: DispatchWorkItem?
@@ -496,7 +648,11 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
         lyricLabel.lineBreakMode = .byWordWrapping
         lyricLabel.cell?.wraps = true
         lyricLabel.cell?.isScrollable = false
-        [titleLabel!, artistLabel!, lyricLabel!].forEach { expandedContent.addSubview($0) }
+        translationLabel = label("", x: 18, y: 10, width: 178, size: 11, color: .secondaryLabelColor)
+        translationLabel.frame.size.height = 18
+        translationLabel.lineBreakMode = .byTruncatingTail
+        translationLabel.isHidden = true
+        [titleLabel!, artistLabel!, lyricLabel!, translationLabel!].forEach { expandedContent.addSubview($0) }
 
         addButton("backward.fill", x: 210, y: 71, action: #selector(previous))
         addButton("playpause.fill", x: 244, y: 71, action: #selector(playPause))
@@ -579,6 +735,7 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
             lyricLines = []
             instrumental = false
             lyricsLoading = true
+            resetTranslation()
             lyricLabel.stringValue = "正在查找同步歌词…"
             lyrics.fetch(for: current) { [weak self] result in
                 DispatchQueue.main.async {
@@ -594,20 +751,40 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
             lyricLines = []
             instrumental = false
             lyricsLoading = false
+            resetTranslation()
             lyricLabel.stringValue = "♪  歌词会显示在这里"
         }
+    }
+
+    private func resetTranslation() {
+        translationLabel.isHidden = true
+        translationLabel.stringValue = ""
+        lyricLabel.frame = NSRect(x: 18, y: 10, width: 178, height: 36)
+        lyricLabel.maximumNumberOfLines = 2
+        lyricLabel.lineBreakMode = .byWordWrapping
+        lyricLabel.cell?.wraps = true
     }
 
     private func refreshLyric() {
         guard let track else { return }
         guard !lyricsLoading else { return }
+        resetTranslation()
         if instrumental { lyricLabel.stringValue = "纯音乐，请欣赏"; return }
         guard !lyricLines.isEmpty else {
             lyricLabel.stringValue = "暂未找到同步歌词"
             return
         }
         let time = track.livePosition
-        lyricLabel.stringValue = lyricLines.last(where: { $0.time <= time })?.text ?? lyricLines[0].text
+        let line = lyricLines.last(where: { $0.time <= time }) ?? lyricLines[0]
+        lyricLabel.stringValue = line.text
+        if let translation = line.translation, !translation.isEmpty {
+            lyricLabel.frame = NSRect(x: 18, y: 28, width: 178, height: 18)
+            lyricLabel.maximumNumberOfLines = 1
+            lyricLabel.lineBreakMode = .byTruncatingTail
+            lyricLabel.cell?.wraps = false
+            translationLabel.stringValue = translation
+            translationLabel.isHidden = false
+        }
     }
 
     private func animatePulse() {
@@ -814,6 +991,7 @@ private final class EdgeTuneApp: NSObject, NSApplicationDelegate {
         edgeGradient.colors = stops
         CATransaction.commit()
         lyricLabel.textColor = selectedWindowTheme == .dark ? colors[0] : colors[0].blended(withFraction: 0.42, of: .black)
+        translationLabel.textColor = selectedWindowTheme == .dark ? NSColor(calibratedWhite: 0.82, alpha: 1) : NSColor(calibratedWhite: 0.32, alpha: 1)
     }
 
     @objc private func changePulse() {
